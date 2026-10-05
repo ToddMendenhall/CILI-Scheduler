@@ -1,0 +1,54 @@
+{
+  "name": "cili-scheduler",
+  "productName": "CILI Scheduler",
+  "version": "1.2.0",
+  "description": "CILI in-line inspection scheduling and milestone tracking",
+  "main": "main.js",
+  "author": "Cypress In-Line Inspection",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "electron": "^44.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "com.cypressinlineinspection.scheduler",
+    "productName": "CILI Scheduler",
+    "files": [
+      "main.js",
+      "preload.js",
+      "store.js",
+      "app/**"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  }
+}
