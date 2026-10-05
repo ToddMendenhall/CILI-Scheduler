@@ -17,14 +17,22 @@ Project-Manager. It is cloud-only: there is no desktop or offline build.
 ```bash
 npm install
 npm run dev               # dev server
-npm run build             # production build (also type-checks)
+npm run build             # production build (also type-checks); on Vercel production it migrates first
 npx tsc --noEmit          # type-check only
 npm run db:generate       # generate a migration from db/schema.ts changes
-npm run db:migrate        # run pending migrations
+npm run db:migrate        # run pending migrations by hand
 npm run db:seed           # sample org + admin (admin@example.com / password123)
 ```
 
 `DATABASE_URL` and `AUTH_SECRET` must be set (see `.env.example`). Lint isn't configured.
+
+Migrations deploy themselves. The `build` script runs `tsx db/migrate.ts --deploy`
+before `next build`, which applies pending migrations only when
+`VERCEL_ENV=production` (a merge to `main`), and is skipped for local and preview
+builds. So a schema change ships by committing its generated migration
+(`npm run db:generate`) with the code that needs it. Migrations must stay safe to
+apply while the previous deploy is still serving traffic, so make additive changes
+and only remove columns in a later deploy.
 
 There is no automated test suite. Verify each change the way Project-Manager does:
 typecheck → build → smoke-test with a throwaway Playwright script against a real local
