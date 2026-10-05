@@ -38,19 +38,29 @@ npm run dev               # http://localhost:3000
 
 ### Deploy (Neon + Vercel)
 
-1. **Neon:** create a project. Copy its **pooled** connection string; the host contains
-   `-pooler`.
-2. **Database tables:** from your machine, with `DATABASE_URL` set to that string, run
-   `npm run db:migrate`. Re-run it whenever a change adds a migration in `db/migrations/`.
-3. **Vercel:** *Add New → Project*, import this GitHub repo, and set these environment
+1. **Neon:** create a project. Open **Connect**, turn on **Connection pooling**, and copy
+   the connection string; its host contains `-pooler`.
+2. **Vercel:** *Add New → Project*, import this GitHub repo, and set these environment
    variables:
    - `DATABASE_URL`: the Neon pooled connection string
    - `AUTH_SECRET`: a random secret (`npx auth secret`)
-4. Deploy, open the site, and register your organization at `/register`. Then invite
-   your teammates from **Members**.
+
+   You can instead connect Neon from Vercel (**Storage → Connect Database → Neon**),
+   which sets `DATABASE_URL` for you. You still add `AUTH_SECRET` yourself.
+3. Deploy. The production build creates the database tables itself (see below). Then
+   open the site, register your organization at `/register`, and invite your teammates
+   from **Members**.
 
 Every push to `main` redeploys production. Every other branch and pull request gets its
 own preview URL.
+
+**Database migrations run automatically on production deploys.** `npm run build` runs
+`db/migrate.ts --deploy` before `next build`. It applies pending migrations only when
+`VERCEL_ENV=production`, so preview builds for branches and PRs never change the live
+database, and local builds don't touch any database. A migration that fails, fails the
+deploy, so the site never goes live against a schema it doesn't match. If
+`DATABASE_URL_UNPOOLED` is set (Vercel's Neon integration sets it), migrations use that
+direct connection. To migrate a database by hand, run `npm run db:migrate`.
 
 ## Working on it
 
