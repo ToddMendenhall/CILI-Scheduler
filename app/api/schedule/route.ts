@@ -5,9 +5,8 @@ import { db } from "@/db";
 import { schedules, scheduleSnapshots, users } from "@/db/schema";
 import { getOrgContextOrNull } from "@/lib/org";
 
-// The scheduler document for the signed-in user's org. This is the server
-// end of the storage bridge in public/scheduler/server-store.js, which the
-// scheduler page talks to exactly as it talks to the desktop app's data file.
+// The scheduler document for the signed-in user's org, loaded and saved by
+// the storage section of scheduler/index.html.
 
 const DAILY_KEEP = 30;
 const REPLACED_KEEP = 20;
@@ -59,7 +58,7 @@ export async function GET(request: Request) {
   );
 }
 
-// Mirrors desktopDataProblem() in the scheduler: anything that doesn't hold the
+// Mirrors storeDataProblem() in the scheduler: anything that doesn't hold the
 // lists is refused rather than stored, so a bad save can't replace real data.
 const listOrMissing = z.array(z.record(z.unknown())).optional();
 const saveSchema = z.object({
@@ -129,8 +128,7 @@ export async function PUT(request: Request) {
       };
     }
 
-    // Writing over a version this window never saw: keep that version first,
-    // like the desktop app's replaced-… copies.
+    // Writing over a version this window never saw: keep that version first.
     if ((force && row.version !== baseVersion) || keepOld) {
       await tx.insert(scheduleSnapshots).values({
         orgId,

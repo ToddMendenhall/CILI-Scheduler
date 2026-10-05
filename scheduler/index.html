@@ -1153,9 +1153,9 @@
         <div class="cili-section" style="padding-top:0;">
           <div class="cili-section-title">Export</div>
           <p id="exportBlurb" style="font-size:13px; color:var(--text-2); margin:0 0 12px;">
-            Downloads every project, tool, person and piece of equipment as a single file.
-            Keep a copy somewhere you control &mdash; this is the only copy of your data that
-            does not live inside this app.
+            Downloads every project, tool, person and piece of equipment as a single file, for
+            keeping your own copy or handing it to someone. The schedule itself is saved on the
+            server, which also keeps a snapshot from the start of each day.
           </p>
           <div id="backupSummary" style="font-size:12.5px; color:var(--text-3); margin-bottom:12px;"></div>
           <button class="cili-btn cili-btn-primary" id="exportBtn">Download backup file</button>
@@ -1165,7 +1165,8 @@
           <div class="cili-section-title">Import</div>
           <p style="font-size:13px; color:var(--text-2); margin:0 0 12px;">
             Restores from a backup file. You choose whether to merge it into what is already
-            here, or replace everything.
+            here, or replace everything. Either way the change is saved for everyone in your
+            organization.
           </p>
           <div class="cili-field" style="margin-bottom:12px;">
             <label>Backup file</label>
@@ -1331,7 +1332,7 @@ var FIELD_PHASE_KEYS = ['prep','mob','onsite','demob','refurb'];
 var CREW_PHASE_KEYS = ['prep','mob','onsite','demob'];
 var MIN_WEEKS = 1, MAX_WEEKS = 8;
 
-// Icons are inline so the desktop app draws them with no network.
+// Icons are inline, so they draw without fetching anything.
 function svgIcon(paths){ return '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">' + paths + '</svg>'; }
 var ICON = {
   projects:  svgIcon('<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.2"/><circle cx="4.5" cy="12" r="1.2"/><circle cx="4.5" cy="18" r="1.2"/>'),
@@ -1601,338 +1602,211 @@ function seedData(){
 }
 
 // ---------- storage ----------
-// Uses the browser's own localStorage rather than a host-injected API. That API only
-// exists inside Anthropic's artifact runtime, so opening this file directly meant every
-// save silently went nowhere. localStorage works both in a published page and in a
-// downloaded file, and it is synchronous, so there is no load/save race to lose data to.
-// Never change this prefix: it is the address your saved data lives at, and renaming
-// it would orphan every tool, person and project already entered.
-var STORE_PREFIX = 'cili_scheduler_';
-var storageUnavailable = false;
+// The schedule lives on the server: one document per organization, read and written
+// through /api/schedule (app/api/schedule/route.ts). The document has the same shape as
+// a backup file — format, version, savedAt, config and the four lists — so a backup can
+// be restored over it, and the stored schedule can be exported as one.
+//
+// Every save names the server version it was built on. The server refuses a save whose
+// base is out of date, so two people editing at once can never silently overwrite each
+// other: the save from here stops and the banner asks which version to keep.
+var SCHEDULE_API = '/api/schedule';
 var loadFailed = false, loadError = '';
-
-// Where the data lives depends on how the app was opened, and the rest of the code
-// does not need to care. Running as a desktop application there is a bridge to the
-// filesystem and records go in a real file with no size limit. Opened as a web page
-// there is only browser storage. Later a server adapter slots in here the same way,
-// and nothing above this line changes.
-var storeMode = 'browser';          // 'desktop' | 'browser' | 'none'
-// Set when stored data existed but could not be read. Nothing may be written after
-// that: an unreadable file still holds the real record, and an empty parse looks
-// exactly like an empty file — so without this the seed data would be written
+// Set when a stored schedule existed but could not be read. Nothing may be written after
+// that: an unreadable schedule still holds the real record, and an empty parse looks
+// exactly like an empty schedule — so without this the seed data would be written
 // straight over twenty years of work.
 var saveBlocked = false;
-var desktopBridge = null;
-var memoryStore = {};               // what loaded, so saves can write the whole file
-
-// The desktop app opens this page with ?desktop=1. If it arrives without the bridge to
-// the data file, the fallback below would quietly use browser storage inside the app's
-// hidden profile — and you would believe your work was in Documents when it was not.
-// So in the desktop app, a missing bridge stops all saving and says so instead.
-var desktopBridgeMissing = false;
-// Served by the web app, the bridge is the server (public/scheduler/server-store.js in
-// the web app) rather than a file on this computer. The same desktop code path runs; only
-// the wording changes, plus watching for other people's saves (watchServer, below).
-var serverMode = false;
-function storeText(desktopText, serverText){ return serverMode ? serverText : desktopText; }
-function recordName(){ return storeText('the data file', 'the shared schedule'); }
-function openedAsDesktopApp(){
-  try { return /(^|[?&])desktop=1(&|$)/.test(String(window.location.search || '')); }
-  catch(e){ return false; }
-}
-function detectStore(){
-  if(window.ciliStore && typeof window.ciliStore.load === 'function'){
-    desktopBridge = window.ciliStore; storeMode = 'desktop';
-    serverMode = window.ciliStore.kind === 'server';
-    return;
-  }
-  if(openedAsDesktopApp()){
-    storeMode = 'none'; desktopBridgeMissing = true; saveBlocked = true; return;
-  }
-  try{
-    var k = STORE_PREFIX + '__probe';
-    window.localStorage.setItem(k, '1');
-    window.localStorage.removeItem(k);
-    storeMode = 'browser';
-  }catch(e){ storeMode = 'none'; }
-}
-function storageAvailable(){ return storeMode !== 'none'; }
-function readKey(key){
-  if(storeMode === 'desktop'){
-    var v = memoryStore[key];
-    return (v === undefined || v === null) ? null : JSON.stringify(v);
-  }
-  try{ return window.localStorage.getItem(STORE_PREFIX + key); }
-  catch(e){ return null; }
-}
-// Writes are debounced: a burst of edits becomes one write rather than five, which
-// matters once the file is on a server instead of a local disk.
+var serverVersion = 0;      // the version of the schedule this window last loaded or saved
+var savedDoc = {};          // the document as it loaded
+var docExtras = {};         // anything else the document held, written back untouched
+// Writes are debounced: a burst of edits becomes one save rather than five.
 var saveTimer = null, savePending = false;
 var dataVersion = 0;
 var LIST_KEYS = ['tools', 'personnel', 'equipment', 'projects'];
 function isRecord(x){ return !!x && typeof x === 'object' && !Array.isArray(x); }
 
+// The session has expired: send the whole tab (not just the frame this page runs in) to
+// sign in, and back here afterwards.
+function signedOut(){
+  try { window.top.location.href = '/login?callbackUrl=%2Fdashboard'; } catch(e){}
+}
+// Resolves to { status, body } for any answer from the server; rejects only when the
+// server could not be reached at all.
+function callScheduleApi(method, body, query){
+  var opts = { method: method, credentials: 'same-origin', cache: 'no-store' };
+  if(body !== undefined){
+    opts.headers = { 'Content-Type': 'application/json' };
+    opts.body = body;
+    // lets the last save finish if the tab closes mid-write (browsers cap this at 64KB)
+    opts.keepalive = body.length < 60000;
+  }
+  return fetch(SCHEDULE_API + (query || ''), opts).then(function(res){
+    return res.json().catch(function(){ return null; }).then(function(b){
+      return { status: res.status, body: isRecord(b) ? b : {} };
+    });
+  });
+}
+
 // ---------- what could not be saved ----------
-// A write that fails has to stay on screen until it goes through. It used to be a
-// three-second message, usually replaced at once by "Project saved" — so a full browser
-// store, or a data file that could not be written, looked exactly like success.
-var unsaved = {};      // browser: list name -> true while its last write failed
-// desktop: one write at a time, and what became of the last one
-var deskSave = { busy: false, again: false, failed: false, conflict: false, why: '', tries: 0, timer: null, keepOld: false };
-var desktopExtras = {};   // anything else the data file held, written back untouched
-function hasUnsaved(){ return LIST_KEYS.some(function(k){ return !!unsaved[k]; }); }
-// Why the change just made is not stored — or '' when it is, or is on its way to the file.
+// A save that fails has to stay on screen until it goes through. A short message,
+// replaced at once by "Project saved", would make a failed save look exactly like success.
+// One save at a time, and what became of the last one:
+var serverSave = { busy: false, again: false, failed: false, conflict: false, why: '', tries: 0, timer: null, keepOld: false };
+// Why the change just made is not stored — or '' when it is, or is on its way to the server.
 function notSavedReason(){
-  if(desktopBridgeMissing) return 'the app cannot reach its data file';
   if(saveBlocked) return 'saving is switched off';
-  if(storeMode === 'none') return 'this browser is blocking storage';
-  if(hasUnsaved()) return 'browser storage is full or blocked';
-  if(deskSave.conflict) return storeText('the data file was changed outside this window',
-                                        'someone else saved the schedule since this window loaded it');
-  if(deskSave.failed) return storeText('the data file could not be written', deskSave.why || 'the server could not save it');
+  if(serverSave.conflict) return 'someone else saved the schedule since this window loaded it';
+  if(serverSave.failed) return serverSave.why || 'the server could not save it';
   return '';
 }
 // The usual confirmation after a change, unless the change could not be stored.
 function savedToast(msg, opts, notSavedMsg){
   var why = notSavedReason();
   if(!why){ showToast(msg, opts); return; }
-  showToast('Not saved \u2014 ' + why + '. ' + (notSavedMsg || 'The change is on screen only.'),
+  showToast('Not saved — ' + why + '. ' + (notSavedMsg || 'The change is on screen only.'),
             { duration: 9000, action: opts && opts.action, onAction: opts && opts.onAction });
 }
-// Returns whether the list is now stored (in the desktop app: on its way to the file).
+// Marks the change for saving. Returns whether it is on its way to the server.
 function saveKey(key, data){
   // zoom and view settings are not data; only a real change rebuilds the caches
   if(key !== 'config') dataVersion++;
   if(saveBlocked) return false;
-  if(storeMode === 'none'){ storageUnavailable = true; return false; }
-  if(storeMode === 'desktop'){
-    memoryStore[key] = data;
-    savePending = true;
-    if(saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(flushDesktopSave, 250);
-    return !deskSave.failed && !deskSave.conflict;
-  }
-  var ok = true;
-  try{ window.localStorage.setItem(STORE_PREFIX + key, JSON.stringify(data)); }
-  catch(e){ ok = false; }
-  if(key === 'config') return ok;            // a zoom setting that did not stick is not lost work
-  if(ok === !unsaved[key]) return ok;        // nothing new to say
-  if(ok) delete unsaved[key]; else unsaved[key] = true;
-  renderStorageWarning();
-  return ok;
+  savePending = true;
+  if(saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSave, 250);
+  return !serverSave.failed && !serverSave.conflict;
 }
-// Tries again to store whatever the browser refused.
-function retryUnsaved(){
-  var keys = LIST_KEYS.filter(function(k){ return !!unsaved[k]; });
-  keys.forEach(function(k){ saveKey(k, state[k]); });
-  if(!hasUnsaved()) showToast('Saved');
-  else showToast('Still not saved \u2014 browser storage is full or blocked. Download a backup so this work is not lost.', { duration: 9000 });
-}
-function desktopPayload(){
+function schedulePayload(){
   var out = {};
-  // whatever else the file held goes back with it, so a later version's additions are
-  // not dropped by an earlier one
-  Object.keys(desktopExtras).forEach(function(k){ out[k] = desktopExtras[k]; });
+  // whatever else the document held goes back with it, so a later version's additions
+  // are not dropped by an earlier one
+  Object.keys(docExtras).forEach(function(k){ out[k] = docExtras[k]; });
   out.format = BACKUP_FORMAT; out.version = BACKUP_VERSION; out.savedAt = new Date().toISOString();
   out.config = state.config; out.tools = state.tools; out.personnel = state.personnel;
   out.equipment = state.equipment; out.projects = state.projects;
   return out;
 }
-// opts.force     — the person chose to keep this window's version over a changed file
-// opts.unloading — the window is closing: send now, even with a write still in flight
-function flushDesktopSave(opts){
+// opts.force     — the person chose to keep this window's version over a newer one
+// opts.unloading — the tab is closing: send now, even with a save still in flight
+function flushSave(opts){
   opts = (opts && typeof opts === 'object') ? opts : {};
   if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; }
-  if(saveBlocked || !desktopBridge) return;
-  if(deskSave.conflict && !opts.force) return;      // waiting for the person to choose
+  if(saveBlocked) return;
+  if(serverSave.conflict && !opts.force) return;      // waiting for the person to choose
   if(!savePending && !opts.force) return;
-  // One write at a time. A second sent while the first was still going could land
+  // One save at a time. A second sent while the first was still going could land
   // first and then be overwritten by the older one.
-  if(deskSave.busy && !opts.unloading){ deskSave.again = true; return; }
-  if(deskSave.timer){ clearTimeout(deskSave.timer); deskSave.timer = null; }
-  deskSave.busy = true; savePending = false;
-  var how = {};
-  if(opts.force) how.force = true;
-  if(deskSave.keepOld) how.keepOld = true;
-  var settled = false;
-  var done = function(res, err){
-    if(settled) return;
-    settled = true;
-    deskSave.busy = false;
-    if(res && res.ok){
-      var was = deskSave.failed || deskSave.conflict;
-      deskSave.failed = false; deskSave.conflict = false; deskSave.why = ''; deskSave.tries = 0;
-      deskSave.keepOld = false;
-      if(was){ renderStorageWarning(); showToast(storeText('Saved to the data file', 'Saved')); }
+  if(serverSave.busy && !opts.unloading){ serverSave.again = true; return; }
+  if(serverSave.timer){ clearTimeout(serverSave.timer); serverSave.timer = null; }
+  serverSave.busy = true; savePending = false;
+  var body = JSON.stringify({ data: schedulePayload(), baseVersion: serverVersion,
+                              force: !!opts.force, keepOld: serverSave.keepOld });
+  var done = function(res){
+    serverSave.busy = false;
+    if(res.ok){
+      var was = serverSave.failed || serverSave.conflict;
+      serverSave.failed = false; serverSave.conflict = false; serverSave.why = ''; serverSave.tries = 0;
+      serverSave.keepOld = false;
+      if(was){ renderStorageWarning(); showToast('Saved'); }
     } else {
-      savePending = true;                            // still owed to the file
-      deskSave.why = (res && res.error) || (err && err.message) || 'unknown error';
-      if(res && res.conflict){
-        if(!deskSave.conflict) showToast(storeText('Not saved \u2014 the data file was changed outside this window',
-                                                'Not saved \u2014 someone else saved the schedule since this window loaded it'), { duration: 9000 });
-        deskSave.conflict = true; deskSave.failed = false;
+      savePending = true;                            // still owed to the server
+      serverSave.why = res.error || 'unknown error';
+      if(res.conflict){
+        if(!serverSave.conflict) showToast('Not saved — someone else saved the schedule since this window loaded it', { duration: 9000 });
+        serverSave.conflict = true; serverSave.failed = false;
       } else {
-        if(!deskSave.failed) showToast(storeText('Not saved \u2014 the data file could not be written (' + deskSave.why + ')',
-                                              'Not saved \u2014 ' + deskSave.why) + '. The app keeps trying.', { duration: 9000 });
-        deskSave.failed = true; deskSave.tries++;
-        // keep trying, a little less often each time, for as long as the window is open
-        deskSave.timer = setTimeout(function(){ deskSave.timer = null; flushDesktopSave(); },
-                                    Math.min(60000, 3000 * deskSave.tries));
+        if(!serverSave.failed) showToast('Not saved — ' + serverSave.why + '. The app keeps trying.', { duration: 9000 });
+        serverSave.failed = true; serverSave.tries++;
+        // keep trying, a little less often each time, for as long as the page is open
+        serverSave.timer = setTimeout(function(){ serverSave.timer = null; flushSave(); },
+                                      Math.min(60000, 3000 * serverSave.tries));
       }
       renderStorageWarning();
     }
-    if(deskSave.again){ deskSave.again = false; if(savePending && !deskSave.conflict) flushDesktopSave(); }
+    if(serverSave.again){ serverSave.again = false; if(savePending && !serverSave.conflict) flushSave(); }
   };
-  var p;
-  try { p = desktopBridge.save(desktopPayload(), how); }
-  catch(e){ done(null, e); return; }
-  if(!p || typeof p.then !== 'function'){ done(p || null, null); return; }
-  p.then(function(res){ done(res, null); }, function(err){ done(null, err); });
+  callScheduleApi('PUT', body).then(function(r){
+    if(r.body.ok){ serverVersion = r.body.version; done({ ok: true }); return; }
+    if(r.status === 401) done({ error: 'you are signed out — sign in again in another tab, then try again' });
+    else if(r.body.conflict) done({ conflict: true, error: r.body.error });
+    else done({ error: r.body.error || ('the server answered ' + r.status) });
+  }, function(){ done({ error: 'the server could not be reached' }); });
 }
-// Nothing should be lost because the window closed inside the debounce window, or while
-// an earlier write had failed and was waiting to be tried again.
+// Nothing should be lost because the tab closed inside the debounce window, or while an
+// earlier save had failed and was waiting to be tried again. Leaving with a change not yet
+// on the server, or a half-edited project, asks first.
 window.addEventListener('beforeunload', function(e){
-  if(savePending) flushDesktopSave({ unloading: true });
-  // In a browser, leaving the page with a half-edited project asks first. (The desktop
-  // app asks in its own way, below: there, refusing to unload would just leave a window
-  // that will not close.)
-  // Served by the web app it is a browser tab again, so it asks the browser's way —
-  // and also while a save has not reached the server yet.
-  var inBrowserTab = storeMode !== 'desktop' || serverMode;
-  if(inBrowserTab && ((projectFormDirty && isOpen('projectModalOverlay')) || (serverMode && savePending))){
+  if(savePending) flushSave({ unloading: true });
+  if(savePending || serverSave.busy || (projectFormDirty && isOpen('projectModalOverlay'))){
     e.preventDefault();
     e.returnValue = '';
   }
 });
-// The desktop app calls this before it closes its window or changes its data folder,
-// and waits for the answer: whatever has not yet gone to the file is sent now.
-function wireDesktopClose(){
-  if(storeMode !== 'desktop') return;
-  window.ciliBeforeClose = function(){
-    return new Promise(function(resolve){
-      try { if(isOpen('resModalOverlay')) commitActiveResCell(); } catch(e){}
-      if(savePending && !saveBlocked && !deskSave.conflict) flushDesktopSave();
-      var waited = 0;
-      (function check(){
-        if(!deskSave.busy || waited >= 6000){
-          resolve({ pending: savePending, failed: deskSave.failed, conflict: deskSave.conflict,
-                    dirtyForm: !!(projectFormDirty && isOpen('projectModalOverlay')) });
-          return;
-        }
-        waited += 25;
-        setTimeout(check, 25);
-      })();
-    });
-  };
-}
 function saveAll(){
   saveKey('config', state.config); saveKey('tools', state.tools);
   saveKey('personnel', state.personnel); saveKey('equipment', state.equipment);
   saveKey('projects', state.projects);
 }
-// Writes every list, or none of them. A backup too big for the browser used to leave
-// its library stored beside the projects that were there before.
-function saveAllOrNothing(){
-  if(storeMode !== 'browser' || saveBlocked){ saveAll(); return !saveBlocked; }
-  var keys = ['config'].concat(LIST_KEYS), old = {};
-  keys.forEach(function(k){ old[k] = readKey(k); });
-  try{
-    keys.forEach(function(k){ window.localStorage.setItem(STORE_PREFIX + k, JSON.stringify(state[k])); });
-  }catch(e){
-    // put back exactly what was there: it fitted before, so it fits again
-    try{
-      keys.forEach(function(k){
-        if(old[k] === null) window.localStorage.removeItem(STORE_PREFIX + k);
-        else window.localStorage.setItem(STORE_PREFIX + k, old[k]);
-      });
-    }catch(e2){}
-    return false;
-  }
-  dataVersion++;
-  LIST_KEYS.forEach(function(k){ delete unsaved[k]; });
-  return true;
-}
-// What is wrong with what the desktop app handed over, or '' if it is usable. A file
-// that exists but does not hold the lists is never treated as "no data yet": that
-// answer seeds the examples and writes them over whatever is really in the file.
-function desktopDataProblem(d){
-  if(!isRecord(d)) return recordName() + ' does not hold CILI Scheduler data';
-  if(!Array.isArray(d.projects)) return recordName() + ' does not hold CILI Scheduler data (there is no project list in it)';
+// What is wrong with the stored schedule, or '' if it is usable. One that exists but does
+// not hold the lists is never treated as "no data yet": that answer seeds an empty
+// schedule and writes it over whatever is really there.
+function storeDataProblem(d){
+  if(!isRecord(d)) return 'the saved schedule does not hold CILI Scheduler data';
+  if(!Array.isArray(d.projects)) return 'the saved schedule does not hold CILI Scheduler data (there is no project list in it)';
   var odd = ['tools', 'personnel', 'equipment'].filter(function(k){ return d[k] !== undefined && !Array.isArray(d[k]); });
-  if(odd.length) return 'the ' + listJoin(odd) + ' list in ' + recordName() + ' cannot be read';
+  if(odd.length) return 'the ' + listJoin(odd) + ' list in the saved schedule cannot be read';
   return '';
 }
-var KNOWN_FILE_KEYS = { format: 1, version: 1, savedAt: 1, config: 1, tools: 1, personnel: 1, equipment: 1, projects: 1 };
-function takeDesktopData(d){
-  memoryStore = d;
-  desktopExtras = {};
-  Object.keys(d).forEach(function(k){ if(!KNOWN_FILE_KEYS[k]) desktopExtras[k] = d[k]; });
+var KNOWN_DOC_KEYS = { format: 1, version: 1, savedAt: 1, config: 1, tools: 1, personnel: 1, equipment: 1, projects: 1 };
+function takeDoc(d){
+  savedDoc = d;
+  docExtras = {};
+  Object.keys(d).forEach(function(k){ if(!KNOWN_DOC_KEYS[k]) docExtras[k] = d[k]; });
 }
 function loadState(cb){
-  detectStore();
-  if(storeMode === 'desktop'){
-    var got = function(res, err){
-      // anything short of a clear "ok" is a failed read, whatever shape it arrives in
-      if(err || !res || res.ok !== true){
-        loadFailed = true;
-        loadError = (res && res.error) || (err && err.message) || (recordName() + ' could not be read');
-      } else if(res.data !== null && res.data !== undefined){
-        var why = desktopDataProblem(res.data);
-        if(why){ loadFailed = true; loadError = why; }
-        else {
-          takeDesktopData(res.data);
-          if(res.unsaved){
-            savePending = true;
-            deskSave.why = res.error || 'unknown error';
-            if(res.conflict) deskSave.conflict = true;
-            else {
-              deskSave.failed = true; deskSave.tries = 1;
-              deskSave.timer = setTimeout(function(){ deskSave.timer = null; flushDesktopSave(); }, 3000);
-            }
-          }
-        }
-      }
-      dataFilePath = (res && res.path) || '';
-      finishLoad(cb);
-    };
-    var answered = false;
-    var once = function(res, err){ if(answered) return; answered = true; got(res, err); };
-    var p;
-    try { p = desktopBridge.load(); } catch(e){ once(null, e); return; }
-    if(!p || typeof p.then !== 'function'){ once(p, null); return; }
-    p.then(function(res){ once(res, null); }, function(err){ once(null, err); });
-    setTimeout(function(){ once(null, new Error(recordName() + ' did not answer within a minute')); }, 60000);
-    return;
-  }
-  if(!storageAvailable()){ storageUnavailable = true; applySeedIfEmpty(); cb(); return; }
-  finishLoad(cb);
-}
-var dataFilePath = '';
-function finishLoad(cb){
-  var raw = {
-    config: readKey('config'), tools: readKey('tools'), personnel: readKey('personnel'),
-    equipment: readKey('equipment'), projects: readKey('projects')
+  var answered = false;
+  var got = function(res){
+    if(answered) return;
+    answered = true;
+    // anything short of a clear "ok" is a failed read, whatever shape it arrives in
+    if(!res.ok){
+      loadFailed = true;
+      loadError = res.error || 'the schedule could not be loaded';
+    } else if(res.data !== null && res.data !== undefined){
+      var why = storeDataProblem(res.data);
+      if(why){ loadFailed = true; loadError = why; }
+      else takeDoc(res.data);
+    }
+    finishLoad(cb);
   };
-  var hasAny = Object.keys(raw).some(function(k){ return raw[k]; });
+  callScheduleApi('GET').then(function(r){
+    if(r.status === 401){ signedOut(); got({ error: 'you are signed out' }); return; }
+    if(!r.body.ok){ got({ error: r.body.error || ('the server answered ' + r.status) }); return; }
+    serverVersion = r.body.version || 0;
+    got({ ok: true, data: r.body.data });
+  }, function(){ got({ error: 'the server could not be reached' }); });
+  setTimeout(function(){ got({ error: 'the server did not answer within a minute' }); }, 60000);
+}
+function finishLoad(cb){
+  var doc = savedDoc;
+  var hasAny = ['config'].concat(LIST_KEYS).some(function(k){ return doc[k] !== undefined && doc[k] !== null; });
   if(!hasAny && loadFailed){
-    // there IS a file, it just could not be parsed — seed nothing, write nothing
+    // there IS a schedule, it just could not be read — seed nothing, write nothing
     saveBlocked = true;
     cb();
     return;
   }
+  // no schedule saved yet for this organization: start an empty one
   if(!hasAny){ applySeedIfEmpty(); saveAll(); cb(); return; }
-  // Each list is read on its own. One that cannot be read no longer hides the others,
-  // and an entry that is not a record no longer stops the app starting.
+  // Each list is read on its own. One that cannot be read does not hide the others,
+  // and an entry that is not a record does not stop the app starting.
   var bad = [];
-  if(raw.config){
-    // zoom and window settings are not the record: one that cannot be read is replaced
-    try { var cfg = JSON.parse(raw.config); if(isRecord(cfg)) state.config = cfg; } catch(e){}
-  }
+  // zoom and window settings are not the record: ones that cannot be read are replaced
+  if(isRecord(doc.config)) state.config = doc.config;
   LIST_KEYS.forEach(function(k){
-    if(!raw[k]) return;
-    var val;
-    try { val = JSON.parse(raw[k]); }
-    catch(e){ bad.push('the ' + k + ' list (' + ((e && e.message) || 'unreadable') + ')'); return; }
+    var val = doc[k];
+    if(val === undefined || val === null) return;
     if(!Array.isArray(val)){ bad.push('the ' + k + ' list (it is not a list)'); return; }
     var good = val.filter(isRecord);
     if(good.length !== val.length){
@@ -1975,7 +1849,7 @@ function sanitizeConfig(){
   if(!(wk >= MIN_WEEKS)) wk = MIN_WEEKS;
   state.config.days = Math.min(MAX_WEEKS, wk) * 7;
 }
-// A session that cannot persist has to say so before real data is typed into it, and a
+// A session that cannot save has to say so before real data is typed into it, and a
 // change that could not be stored has to stay on screen until it is. This bar belongs to
 // those notices alone, so it can be redrawn the moment any of them changes.
 function renderStorageWarning(){
@@ -1987,36 +1861,18 @@ function renderStorageWarning(){
        + (buttons ? '<span class="cili-flagbar-actions">' + buttons + '</span>' : '') + '</div>';
   }
   function btn(act, label){ return '<button type="button" class="cili-btn cili-btn-sm" data-flag-act="' + act + '">' + label + '</button>'; }
-  if(desktopBridgeMissing){
-    note('<strong>Not saving.</strong> The desktop app could not reach its data file, so nothing you enter '
-       + 'here will be kept. Close the app and reopen it; if this keeps happening, reinstall it.');
-  } else if(loadFailed){
-    note('Saved data could not all be read (' + escapeHtml(loadError) + '). <strong>Saving is switched off</strong> '
-       + 'so what is stored is not overwritten. What could be read is shown. To carry on, restore a backup: '
-       + 'Backup, then Replace.', btn('backup', 'Open Backup'));
-  } else if(storageUnavailable){
-    note('<strong>Not saving</strong> &mdash; this browser is blocking storage (private window, or site data '
-       + 'disabled). Download a backup before closing this page.', btn('backup', 'Open Backup'));
+  if(loadFailed){
+    note('The saved schedule could not all be read (' + escapeHtml(loadError) + '). <strong>Saving is switched off</strong> '
+       + 'so what is stored is not overwritten. What could be read is shown. Reload the page to try again; to carry '
+       + 'on from a backup instead, use Backup, then Replace.', btn('backup', 'Open Backup'));
   }
-  if(hasUnsaved()){
-    note('<strong>Not saved.</strong> The last change is on screen but the browser would not store it &mdash; '
-       + 'its storage is full or blocked. Download a backup now so the work is not lost.',
-         btn('retry', 'Try again') + btn('backup', 'Open Backup'));
-  }
-  if(deskSave.conflict && serverMode){
-    var who = deskSave.why || 'someone else saved the schedule since this window loaded it';
+  if(serverSave.conflict){
+    var who = serverSave.why || 'someone else saved the schedule since this window loaded it';
     note('<strong>Not saved.</strong> ' + escapeHtml(who.charAt(0).toUpperCase() + who.slice(1))
        + '. Nothing has been overwritten. Choose which to keep.',
          btn('reload', 'Load the latest version') + btn('force', 'Keep what is here'));
-  } else if(deskSave.conflict){
-    note('<strong>Not saved.</strong> The data file was changed outside this window &mdash; by another computer, '
-       + 'or a copy put in its place. Nothing has been overwritten. Choose which to keep.',
-         btn('reload', 'Load the file\u2019s version') + btn('force', 'Keep what is here'));
-  } else if(deskSave.failed && serverMode){
-    note('<strong>Not saved.</strong> The schedule could not be saved (' + escapeHtml(deskSave.why)
-       + '). The app keeps trying; your changes stay on screen until it succeeds.', btn('retry', 'Try now'));
-  } else if(deskSave.failed){
-    note('<strong>Not saved.</strong> The data file could not be written (' + escapeHtml(deskSave.why)
+  } else if(serverSave.failed){
+    note('<strong>Not saved.</strong> The schedule could not be saved (' + escapeHtml(serverSave.why)
        + '). The app keeps trying; your changes stay on screen until it succeeds.', btn('retry', 'Try now'));
   }
   bar.innerHTML = h;
@@ -2032,84 +1888,73 @@ function syncNoticeHeight(){
 }
 function flagBarAction(act){
   if(act === 'backup'){ var bb = document.getElementById('backupBtn'); if(bb) bb.click(); return; }
-  if(act === 'retry'){
-    if(storeMode === 'desktop'){ savePending = true; flushDesktopSave(); showToast('Trying to save\u2026'); }
-    else retryUnsaved();
-    return;
-  }
+  if(act === 'retry'){ savePending = true; flushSave(); showToast('Trying to save…'); return; }
   if(act === 'force'){
-    askConfirm(storeText('Write what is on screen over the data file?\n\nThe version in the file now is kept as a copy in '
-      + 'the backups folder first, so it can still be recovered.',
-      'Write what is on screen over the latest saved version?\n\nThat version is kept as a snapshot on the server '
-      + 'first, so it can still be recovered.'), 'Keep what is here',
-      function(){ deskSave.keepOld = true; savePending = true; flushDesktopSave({ force: true }); });
+    askConfirm('Write what is on screen over the latest saved version?\n\nThat version is kept as a snapshot on the '
+      + 'server first, so it can still be recovered.', 'Keep what is here',
+      function(){ serverSave.keepOld = true; savePending = true; flushSave({ force: true }); });
     return;
   }
   if(act === 'reload'){
-    askConfirm(storeText('Load the data file as it is now?\n\nChanges made in this window since the file changed '
-      + 'will be lost.', 'Load the latest saved version?\n\nChanges made in this window since then will be lost.'),
-      storeText('Load the file\u2019s version', 'Load the latest version'), function(){ reloadDesktopFile(); });
+    askConfirm('Load the latest saved version?\n\nChanges made in this window since then will be lost.',
+      'Load the latest version', function(){ reloadFromServer(); });
   }
 }
-// Takes the data file as it now stands, discarding what this window holds.
-// opts.quiet — picking up someone else's save (server mode): fail silently, and stand
-// down if anything was edited here while the read was on its way.
-function reloadDesktopFile(opts){
+// Takes the schedule as it now stands on the server, discarding what this window holds.
+// opts.quiet — picking up someone else's save: fail silently, keep this window's zoom and
+// view, and stand down if anything was edited here while the read was on its way.
+function reloadFromServer(opts){
   opts = opts || {};
-  if(!desktopBridge) return;
   var fail = function(why){
-    if(!opts.quiet) showToast('Could not read ' + recordName() + ': ' + why, { duration: 9000 });
+    if(!opts.quiet) showToast('Could not load the schedule: ' + why, { duration: 9000 });
   };
-  var p;
-  try { p = desktopBridge.load({ discardUnsaved: true }); } catch(e){ fail((e && e.message) || 'unknown error'); return; }
-  if(!p || typeof p.then !== 'function'){ fail('no answer from the app'); return; }
-  p.then(function(res){
+  callScheduleApi('GET').then(function(r){
     if(opts.quiet && !quietReloadSafe()) return;
-    if(!res || res.ok !== true){ fail((res && res.error) || 'unknown error'); return; }
-    if(res.data === null || res.data === undefined){ fail(storeText('the file is no longer there', 'it is empty')); return; }
-    var why = desktopDataProblem(res.data);
+    if(r.status === 401){ signedOut(); return; }
+    if(!r.body.ok){ fail(r.body.error || ('the server answered ' + r.status)); return; }
+    var data = r.body.data;
+    if(data === null || data === undefined){ fail('it is empty'); return; }
+    var why = storeDataProblem(data);
     if(why){ fail(why); return; }
     var bad = LIST_KEYS.filter(function(k){
-      var v = res.data[k];
+      var v = data[k];
       return v !== undefined && v !== null && (!Array.isArray(v) || !v.every(isRecord));
     });
     if(bad.length){ fail('its ' + listJoin(bad) + ' list cannot be read'); return; }
-    takeDesktopData(res.data);
-    LIST_KEYS.forEach(function(k){ state[k] = Array.isArray(res.data[k]) ? res.data[k] : []; });
-    // Picking up someone else's save keeps this window's zoom and view, as browser tabs do.
-    if(isRecord(res.data.config) && !opts.quiet) state.config = res.data.config;
+    serverVersion = r.body.version || 0;
+    takeDoc(data);
+    LIST_KEYS.forEach(function(k){ state[k] = Array.isArray(data[k]) ? data[k] : []; });
+    if(isRecord(data.config) && !opts.quiet) state.config = data.config;
     normalizeResources(); normalizeProjects(); sanitizeConfig();
     savePending = false;
-    if(deskSave.timer){ clearTimeout(deskSave.timer); deskSave.timer = null; }
-    deskSave.conflict = false; deskSave.failed = false; deskSave.why = ''; deskSave.tries = 0;
+    if(serverSave.timer){ clearTimeout(serverSave.timer); serverSave.timer = null; }
+    serverSave.conflict = false; serverSave.failed = false; serverSave.why = ''; serverSave.tries = 0;
     undoStack = []; redoStack = [];
     dataVersion++;
     if(isOpen('projectModalOverlay')){ projectFormDirty = false; closeProjectModal(); }
+    renderStorageWarning();
     renderAll(); refreshOpenSheets();
-    if(opts.quiet) showToast('Updated with changes saved' + (opts.by ? ' by ' + opts.by : ' elsewhere'));
-    else showToast(storeText('Loaded the data file as it is now', 'Loaded the latest version'));
-  }, function(err){ fail((err && err.message) || 'unknown error'); });
+    if(opts.quiet) showToast('Updated with changes saved' + (r.body.updatedBy ? ' by ' + r.body.updatedBy : ' elsewhere'));
+    else showToast('Loaded the latest version');
+  }, function(){ fail('the server could not be reached'); });
 }
-// Server mode: someone else may save while this window is open. Every so often, and
-// whenever the window comes back into view, ask whether the schedule has moved on, and
-// if so load it — but only while nothing here is unsaved or half-edited, so their save
-// never replaces work in progress. If both sides change at once, the save from here is
-// refused as a conflict and the banner asks which to keep, as on a shared drive.
+// Someone else may save while this window is open. Every so often, and whenever the
+// window comes back into view, ask whether the schedule has moved on, and if so load it —
+// but only while nothing here is unsaved or half-edited, so their save never replaces
+// work in progress. If both sides change at once, the save from here is refused as a
+// conflict and the banner asks which to keep.
 function quietReloadSafe(){
-  return !saveBlocked && !savePending && !deskSave.busy && !deskSave.conflict && !deskSave.failed
-    && !isOpen('projectModalOverlay') && !isOpen('resModalOverlay') && !isOpen('confirmOverlay');
+  return !saveBlocked && !savePending && !serverSave.busy && !serverSave.conflict && !serverSave.failed
+    && !drag && !isOpen('projectModalOverlay') && !isOpen('resModalOverlay') && !isOpen('confirmOverlay');
 }
 function watchServer(){
-  if(!serverMode || !desktopBridge || typeof desktopBridge.peek !== 'function') return;
   var checking = false;
   function check(){
     if(checking || document.hidden || !quietReloadSafe()) return;
     checking = true;
-    var p;
-    try { p = desktopBridge.peek(); } catch(e){ checking = false; return; }
-    Promise.resolve(p).then(function(res){
+    callScheduleApi('GET', undefined, '?peek=1').then(function(r){
       checking = false;
-      if(res && res.ok && res.changed && quietReloadSafe()) reloadDesktopFile({ quiet: true, by: res.updatedBy });
+      if(r.body.ok && (r.body.version || 0) !== serverVersion && quietReloadSafe()) reloadFromServer({ quiet: true });
     }, function(){ checking = false; });
   }
   setInterval(check, 15000);
@@ -4950,13 +4795,12 @@ function endDrag(commit){
 }
 function commitEdgeMove(D){
   renderAfterDrag = false;
-  refreshFromStorage(['projects']);
   var idx = -1;
   state.projects.forEach(function(x, i){ if(x.id === D.pid) idx = i; });
   if(idx < 0){ renderAll(); showToast('That project is no longer here — nothing was changed'); return; }
   if(canonJSON(normalizedCopy(state.projects[idx])) !== D.origCanon){
     renderAll();
-    showToast('This project was just changed in another window, so the drag was not saved. Try it again.');
+    showToast('Someone else just changed this project, so the drag was not saved. Try it again.');
     return;
   }
   var plan = D.plan, after = plan.p;
@@ -5008,7 +4852,6 @@ function forgetUndoFor(pid){
   redoStack = redoStack.filter(function(x){ return x.pid !== pid; });
 }
 function swapProjectVersion(entry, from, to){
-  refreshFromStorage(['projects']);
   var idx = -1;
   state.projects.forEach(function(x, i){ if(x.id === entry.pid) idx = i; });
   if(idx < 0) return 'gone';
@@ -5245,51 +5088,8 @@ function renderAll(){
   if(isOpen('reportOverlay')) renderReport();
 }
 
-// ---------- more than one window ----------
-// Each open window holds its own copy of the data, and saving writes a whole list back.
-// With the app open in two tabs, a save from the one that had not seen the other's
-// latest changes wrote its out-of-date list straight over them — silently, with no
-// sign in either window that anything had been lost.
-//
-// Two defences. Every write re-reads the latest saved list first and changes only what
-// it set out to change, so a stale window cannot overwrite work saved elsewhere. And a
-// window that is simply open picks up the other's saves as they land, so what it shows
-// stays current. The desktop app only ever allows one window, so this is browser-only.
-var SYNC_KEYS = ['projects', 'tools', 'personnel', 'equipment'];
-function refreshFromStorage(keys){
-  if(storeMode !== 'browser') return false;
-  var changed = false;
-  (keys || SYNC_KEYS).forEach(function(k){
-    // A list this window could not store is newer here than in storage. Re-reading it
-    // now would throw the unsaved work away, so it is kept until the write goes through.
-    if(unsaved[k]) return;
-    var raw = readKey(k);
-    if(!raw) return;
-    try {
-      var val = JSON.parse(raw);
-      if(Array.isArray(val)){ state[k] = val.filter(isRecord); changed = true; }
-    } catch(e){ /* unreadable here: keep what this window has rather than lose it */ }
-  });
-  if(changed){
-    // another tab may be running an older copy of the app, so fill in anything missing
-    normalizeResources(); normalizeProjects(); invalidateVisibility();
-    dataVersion++;
-  }
-  return changed;
-}
-function wireCrossWindowSync(){
-  window.addEventListener('storage', function(e){
-    if(storeMode !== 'browser' || !e || !e.key || e.key.indexOf(STORE_PREFIX) !== 0) return;
-    var k = e.key.slice(STORE_PREFIX.length);
-    if(SYNC_KEYS.indexOf(k) < 0) return;          // zoom and view settings stay per window
-    if(!refreshFromStorage([k])) return;
-    renderAll();                                   // the chart and banners, never an open form
-    refreshOpenSheets();
-    showToast('Updated with changes saved in another window');
-  });
-}
 // Whatever is open beside the schedule is redrawn from the data as it now stands — after
-// another window saved, after a backup was restored, when the day turns over.
+// someone else's save was picked up, after a backup was restored, when the day turns over.
 function refreshOpenSheets(){
   if(isOpen('resModalOverlay')) renderResLibKeepingTyping();
   if(isOpen('historyOverlay')){
@@ -5634,11 +5434,8 @@ function projectFormHtml(p){
 
   h += '<div class="cili-export-row">'
      + '<button class="cili-btn" id="pf_exportPdf" type="button">' + ICON.print
-     + (canPrintHere() ? 'Export project sheet (PDF)' : 'Download project sheet') + '</button>'
-     + '<div class="cili-note">'
-     + (canPrintHere() ? 'Everything recorded for this project on one sheet, to print or send to the crew.'
-        : 'Everything recorded for this project on one sheet. It downloads as a page that opens in any browser, '
-          + 'ready to print or save as PDF.') + '</div>'
+     + 'Export project sheet (PDF)</button>'
+     + '<div class="cili-note">Everything recorded for this project on one sheet, to print or send to the crew.</div>'
      + '</div>';
 
   return h;
@@ -6004,11 +5801,10 @@ function clearFieldError(id){
 }
 
 // A form shows the job as it was when it was opened. If the job has since been changed
-// or deleted — in another window, usually — saving the form would put the old version
+// or deleted — by someone else, usually — saving the form would put the old version
 // back over that work, so it stops and says so first.
 var formBase = '';
 function saveProjectForm(anyway){
-  refreshFromStorage(['projects']);
   if(ui.editingProjectId && anyway !== true){
     var now = findProject(ui.editingProjectId);
     if(!now){
@@ -6018,7 +5814,7 @@ function saveProjectForm(anyway){
       return;
     }
     if(formBase && canonJSON(normalizedCopy(now)) !== formBase){
-      askConfirm('This project was changed somewhere else while it was open here \u2014 in another window, most likely.\n\n'
+      askConfirm('This project was changed somewhere else while it was open here \u2014 by someone else, most likely.\n\n'
         + 'Saving now replaces those changes with what is in this form. To see them first, go back, '
         + 'close this form without saving and open the project again.', 'Save over them',
         function(){ saveProjectForm(true); }, { title: 'This project has changed', cancelLabel: 'Go back' });
@@ -6058,7 +5854,6 @@ function deleteCurrentProject(){
   var proj = state.projects.filter(function(x){ return x.id === target; })[0];
   var name = proj && proj.projectId ? proj.projectId : 'this project';
   askConfirm('Delete "' + name + '"?\n\nThis cannot be undone.', 'Delete Project', function(){
-    refreshFromStorage(['projects']);
     state.projects = state.projects.filter(function(x){ return x.id !== target; });
     saveKey('projects', state.projects);
     closeProjectModal();
@@ -6199,10 +5994,8 @@ function wireResInputs(){
 function resourceCollection(type){
   return type==='tool' ? state.tools : type==='personnel' ? state.personnel : state.equipment;
 }
-function resourceStoreKey(type){ return type === 'tool' ? 'tools' : type; }
 var pendingRename = Object.create(null);   // row key -> the label its jobs still carry
 function updateResourceField(type, rowKey, field, value, inputEl){
-  refreshFromStorage([resourceStoreKey(type), 'projects']);
   var coll = resourceCollection(type);
   var row = coll.filter(function(r){ return r.key === rowKey; })[0];
   if(!row) return;
@@ -6287,7 +6080,6 @@ function offerLevelUpdate(name, level){
     + '? Completed jobs keep the level they were worked at either way.',
     'Update ' + (one ? 'that job' : 'those jobs'),
     function(){
-      refreshFromStorage(['projects']);
       var n = 0;
       state.projects.forEach(function(p){
         if(p.status === 'Complete' || p.status === 'Lost') return;
@@ -6319,7 +6111,6 @@ function refreshDupeFlags(type){
   else if(html) document.getElementById('resLibBody').insertAdjacentHTML('afterbegin', html);
 }
 function removeResource(type, rowKey){
-  refreshFromStorage([resourceStoreKey(type), 'projects']);
   var coll = resourceCollection(type);
   var row = coll.filter(function(r){ return r.key === rowKey; })[0];
   if(!row) return;
@@ -6363,9 +6154,6 @@ function removeResource(type, rowKey){
         + (kept === 1 ? 's' : '') + ' it on record.';
   }
   askConfirm(msg, 'Delete ' + noun, function(){
-  // The question may have sat open while another window added a row or assigned this
-  // one. The answer is applied to the lists as they are now, not as they were then.
-  refreshFromStorage([resourceStoreKey(type), 'projects']);
   var now = resourceCollection(type);
   // Remove by key, so a row that happens to share an ID with another is left alone.
   var filtered = now.filter(function(r){ return r.key !== rowKey; });
@@ -6412,7 +6200,6 @@ function nextFreeResourceId(coll, prefix){
   return prefix + n;
 }
 function addResource(type){
-  refreshFromStorage([resourceStoreKey(type)]);
   if(type==='tool'){ state.tools.push({key:uid('tool'), id:nextFreeResourceId(state.tools,'NEW-TOOL-'), size:'', config:'', status:'Available', notes:''}); saveKey('tools', state.tools); }
   else if(type==='personnel'){ state.personnel.push({key:uid('per'), id:uid('per'), name:'New person', role:'', notes:''}); saveKey('personnel', state.personnel); }
   else { state.equipment.push({key:uid('equip'), id:nextFreeResourceId(state.equipment,'NEW-EQUIP-'), type:'', desc:'', notes:''}); saveKey('equipment', state.equipment); }
@@ -7127,32 +6914,8 @@ function renderBackupSummary(){
   var line = state.projects.length + ' projects · ' + state.tools.length + ' tools · '
     + state.personnel.length + ' personnel · ' + state.equipment.length + ' equipment';
   el.innerHTML = escapeHtml(line);
-  if(storeMode === 'desktop' && desktopBridge.info){
-    var shown = function(i){
-      if(!i) return;
-      el.innerHTML = escapeHtml(line)
-        + '<div style="margin-top:6px; font-size:11.5px;">Data file: <code>'
-        + escapeHtml(i.path) + '</code></div>'
-        + '<div style="font-size:11.5px;">Rolling backups kept in <code>'
-        + escapeHtml(i.backups) + '</code></div>';
-    };
-    try { desktopBridge.info().then(shown, function(){}); } catch(e){}
-  }
 }
-// A published page runs sandboxed, where a script-triggered anchor download is inert:
-// nothing reaches the viewer. The platform's downloads capability is the supported
-// route, with the anchor kept only for the page opened outside the artifact runtime.
-// Either way the toast reports what actually happened rather than assuming success.
-var downloadsApi;
-function getDownloads(){
-  if(downloadsApi !== undefined) return Promise.resolve(downloadsApi);
-  if(!(window.claude && typeof window.claude.use === 'function')){
-    downloadsApi = null; return Promise.resolve(null);
-  }
-  return window.claude.use('downloads').then(function(api){
-    downloadsApi = api || null; return downloadsApi;
-  }).catch(function(){ downloadsApi = null; return null; });
-}
+// The toast reports what actually happened rather than assuming the download worked.
 function anchorDownload(filename, data, mime){
   try{
     var blob = new Blob([data], {type: mime || 'application/json'});
@@ -7167,37 +6930,9 @@ function anchorDownload(filename, data, mime){
 function exportBackup(){
   var data = JSON.stringify(buildBackup(), null, 2);
   var filename = 'CILI_Scheduler_backup_' + todayISO() + '.json';
-  if(storeMode === 'desktop' && desktopBridge.export){
-    var said = function(res){
-      if(res && res.ok) showToast('Backup saved to ' + res.path);
-      else if(res && res.cancelled) showToast('Backup cancelled');
-      else { showExportFallback(data, filename, true);
-             showToast('Could not save the backup' + (res && res.error ? ': ' + res.error : '') + ' \u2014 copy the text below instead', { duration: 9000 }); }
-    };
-    try {
-      desktopBridge.export({filename: filename, data: data}).then(said, function(err){ said({ error: err && err.message }); });
-    } catch(e){ said({ error: e && e.message }); }
-    return;
-  }
   showExportFallback(data, filename, false);
-  getDownloads().then(function(api){
-    if(!api){
-      if(anchorDownload(filename, data)) showToast('Backup downloaded');
-      else { showExportFallback(data, filename, true); showToast('Copy the text below to save your backup'); }
-      return;
-    }
-    api.save({filename: filename, data: data}).then(function(res){
-      if(res && res.status === 'saved'){ showToast('Backup saved'); return; }
-      // anything else is not a saved file, so the text is put where it can be copied
-      showExportFallback(data, filename, true);
-      showToast('The backup may not have been saved \u2014 copy the text below to be sure', { duration: 9000 });
-    }).catch(function(err){
-      var code = err && err.code;
-      if(code === 'declined'){ showToast('Backup cancelled'); return; }
-      showExportFallback(data, filename, true);
-      showToast('Could not save a file here — copy the text below instead');
-    });
-  });
+  if(anchorDownload(filename, data)) showToast('Backup downloaded');
+  else { showExportFallback(data, filename, true); showToast('Copy the text below to save your backup'); }
 }
 // Always-available escape hatch: the raw backup as selectable text. A backup people
 // cannot actually get out of the page is not a backup.
@@ -7357,19 +7092,15 @@ function applyImportText(text, mode, fail, out, input){
       return;
     }
     // Restoring a backup is the way out of "saving is switched off", so Replace has to
-    // be able to save. All of it is stored, or none of it.
-    if(mode === 'replace') saveBlocked = false;
-    if(!saveAllOrNothing()){
-      var chars = JSON.stringify([state.config, state.tools, state.personnel, state.equipment, state.projects]).length;
-      putBack();
-      renderAll();
-      fail('That backup is too big for this browser to keep: it needs room for about ' + (chars / 1e6).toFixed(1)
-         + ' million characters and a browser allows about 5 million. Nothing was changed. The desktop app has no size limit.');
-      return;
-    }
+    // be able to save. The whole schedule goes to the server as one document, so all of
+    // it is stored, or none of it.
     if(mode === 'replace'){
-      // in the desktop app the file that could not be read is kept as a copy before it is replaced
-      if(keep.loadFailed && storeMode === 'desktop') deskSave.keepOld = true;
+      saveBlocked = false;
+      // a saved schedule that could not be read is kept as a snapshot before it is replaced
+      if(keep.loadFailed) serverSave.keepOld = true;
+    }
+    saveAll();
+    if(mode === 'replace'){
       loadFailed = false; loadError = '';
       undoStack = []; redoStack = [];
     }
@@ -7796,7 +7527,7 @@ function renderReport(resultsOnly){
   var slot = resultsOnly === true ? document.getElementById('reportResults') : null;
   if(slot) slot.innerHTML = h;
   else {
-    // a full redraw from elsewhere (another window saved, the day turned) keeps the caret
+    // a full redraw from elsewhere (someone else's save, the day turned) keeps the caret
     var af = document.activeElement, caret = null;
     if(af && af.id === 'repFind'){ try { caret = [af.selectionStart, af.selectionEnd]; } catch(e){ caret = [0, 0]; } }
     body.innerHTML = reportFiltersHtml() + '<div id="reportResults">' + h + '</div>';
@@ -7942,11 +7673,6 @@ function wireReportResults(body){
   });
 }
 function openReport(person){
-  var pb = document.getElementById('reportPrintBtn');
-  if(pb && !canPrintHere()){
-    pb.lastChild.textContent = 'Download sheet';
-    pb.title = 'A page that opens in any browser, ready to print or save as PDF';
-  }
   report.person = String(person || '').trim();
   report.personKey = libraryKeyOf(report.person);
   if(report.person) report.find = '';
@@ -8001,38 +7727,7 @@ function brandLogoSrc(){
   var img = document.querySelector('.cili-brand-logo');
   return img ? img.getAttribute('src') : '';
 }
-// A published page runs in a frame where the browser's print dialog is switched off.
-// There the sheet is offered as a file instead: a page that opens in any browser, ready
-// to print or save as PDF. Opened as a file, or in the desktop app, it prints directly.
-function canPrintHere(){ return !(window.claude && typeof window.claude.use === 'function'); }
-function sheetCss(){
-  var out = [];
-  Array.prototype.forEach.call(document.styleSheets, function(ss){
-    var rules;
-    try { rules = ss.cssRules; } catch(e){ return; }
-    Array.prototype.forEach.call(rules || [], function(r){
-      if(r.selectorText && r.selectorText.indexOf('.cili-sheet') > -1 && r.selectorText.indexOf('.cili-app') < 0) out.push(r.cssText);
-    });
-  });
-  return out.join('\n');
-}
-function standaloneSheet(html, title, landscape){
-  return '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-    + '<meta name="viewport" content="width=device-width, initial-scale=1"><title>' + escapeHtml(title) + '</title>'
-    + '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap">'
-    + '<style>' + sheetCss()
-    + '\nhtml,body{margin:0;background:#fff;}'
-    + '\n.cili-sheet{display:block;max-width:' + (landscape ? '10in' : '7.6in') + ';margin:28px auto;padding:0 16px;}'
-    + '\n@page{size:letter ' + (landscape ? 'landscape' : 'portrait') + ';margin:14mm;}'
-    + '\n@media print{.cili-sheet{margin:0;max-width:none;padding:0;}}'
-    + '</style></head><body><div class="cili-sheet">' + html + '</div></body></html>';
-}
 function printSheet(html, title, landscape){
-  if(!canPrintHere()){
-    var safe = String(title || 'CILI sheet').replace(/[\\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim();
-    saveTextFile(safe + '.html', standaloneSheet(html, title, landscape), 'text/html', 'Sheet');
-    return;
-  }
   var el = document.getElementById('projectSheet');
   el.innerHTML = html;
   el.classList.toggle('landscape', !!landscape);
@@ -8130,36 +7825,10 @@ function reportSheetHtml(){
   return h;
 }
 
-// A file offered to the viewer however this page is running: the desktop app's own save
-// dialog, the platform's downloads capability in a published page, or a plain download
-// when opened as a file.
+// A file offered to the viewer as a plain download.
 function saveTextFile(filename, text, mime, what){
-  if(storeMode === 'desktop' && desktopBridge && desktopBridge.export){
-    var said = function(res){
-      if(res && res.ok) showToast(what + ' saved to ' + res.path);
-      else if(res && res.cancelled) showToast('Cancelled');
-      else showToast('Could not save the file' + (res && res.error ? ': ' + res.error : ''), { duration: 9000 });
-    };
-    try {
-      desktopBridge.export({ filename: filename, data: text }).then(said, function(err){ said({ error: err && err.message }); });
-    } catch(e){ said({ error: e && e.message }); }
-    return;
-  }
-  getDownloads().then(function(api){
-    if(!api){
-      if(anchorDownload(filename, text, mime)) showToast(what + ' downloaded');
-      else showToast('Could not save a file here');
-      return;
-    }
-    api.save({ filename: filename, data: text }).then(function(res){
-      if(res && res.status === 'saved') showToast(what + ' saved');
-      else showToast(what + ' was not saved', { duration: 7000 });
-    }).catch(function(err){
-      if(err && err.code === 'declined'){ showToast('Cancelled'); return; }
-      if(anchorDownload(filename, text, mime)) showToast(what + ' downloaded');
-      else showToast('Could not save a file here');
-    });
-  });
+  if(anchorDownload(filename, text, mime)) showToast(what + ' downloaded');
+  else showToast('Could not save a file here');
 }
 
 var resizeTimer = null;
@@ -8178,7 +7847,6 @@ function wireStaticEvents(){
   wireRail();
   wireDrag();
   wireRowFilter();
-  wireCrossWindowSync();
   wirePrinting();
   wireTipDelegation();
   wireClickDelegation();
@@ -8243,17 +7911,6 @@ function wireStaticEvents(){
   document.getElementById('backupBtn').addEventListener('click', function(){
     document.getElementById('backupModalOverlay').classList.add('open');
     document.getElementById('importResult').textContent = '';
-    if(serverMode){
-      document.getElementById('exportBlurb').textContent = 'Saves every project, tool, person and piece of equipment '
-        + 'as a single file \u2014 for keeping your own copy or handing it to someone. The schedule itself is already '
-        + 'saved on the server, which also keeps a snapshot from the start of each day.';
-    } else if(storeMode === 'desktop'){
-      // here the data is already a file on this computer, with rolling copies beside it
-      document.getElementById('exportBlurb').textContent = 'Saves every project, tool, person and piece of equipment '
-        + 'as a single file \u2014 for moving the data to another computer or handing it to someone. The app already '
-        + 'keeps its own data file and rolling backups, in the folders shown below.';
-      document.getElementById('exportBtn').textContent = 'Save backup file\u2026';
-    }
     renderBackupSummary();
   });
   function closeBackup(){ document.getElementById('backupModalOverlay').classList.remove('open'); }
@@ -8285,7 +7942,6 @@ function wireStaticEvents(){
 // ---------- init ----------
 loadState(function(){
   wireStaticEvents();
-  wireDesktopClose();
   watchServer();
   renderAll();
   watchTheDay();

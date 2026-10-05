@@ -4,23 +4,19 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { getPrimaryOrgMembership } from "@/lib/org";
 
-// Serves the single-file scheduler — the same file the desktop app ships
-// (desktop/app/index.html) — with the server storage bridge loaded ahead of
-// its own script, so it saves to this org's row in Postgres instead of the
-// browser or a data file. /dashboard shows it in a frame under the app header.
-// next.config.js traces the HTML file into this route's serverless bundle.
+// Serves the single-file scheduler (scheduler/index.html), which loads and
+// saves the org's schedule through /api/schedule. /dashboard shows it in a
+// frame under the app header. next.config.js traces the HTML file into this
+// route's serverless bundle.
 
-const SCHEDULER_FILE = path.join(process.cwd(), "desktop", "app", "index.html");
-const BRIDGE_TAG = '<script src="/scheduler/server-store.js"></script>';
+const SCHEDULER_FILE = path.join(process.cwd(), "scheduler", "index.html");
 
 let cached: string | null = null;
 
 async function schedulerHtml() {
   // Re-read on every request in dev so edits to the file show on reload.
   if (cached && process.env.NODE_ENV === "production") return cached;
-  const html = await readFile(SCHEDULER_FILE, "utf8");
-  if (!html.includes("</head>")) throw new Error("scheduler HTML has no </head> to load the storage bridge into");
-  cached = html.replace("</head>", BRIDGE_TAG + "</head>");
+  cached = await readFile(SCHEDULER_FILE, "utf8");
   return cached;
 }
 

@@ -3,7 +3,7 @@ const nextConfig = {
   // app/scheduler/route.ts reads the scheduler HTML from disk at request time;
   // without this, Vercel's serverless bundle for that route wouldn't include it.
   outputFileTracingIncludes: {
-    "/scheduler": ["./desktop/app/index.html"],
+    "/scheduler": ["./scheduler/index.html"],
   },
 };
 

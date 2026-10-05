@@ -16,11 +16,10 @@ import {
  * org match the signed-in user's org".
  *
  * The scheduler's own data is not split into tables yet. Phase 1 serves the
- * existing single-file scheduler (desktop/app/index.html) unchanged and
- * stores its whole document — the same JSON the desktop app writes to
- * cili-scheduler-data.json — in one jsonb row per org (`schedules`). Later
- * phases move lists out of that document into relational tables one at a
- * time.
+ * existing single-file scheduler (scheduler/index.html) and stores its whole
+ * document — the same JSON as its backup file — in one jsonb row per org
+ * (`schedules`). Later phases move lists out of that document into
+ * relational tables one at a time.
  */
 
 export const memberRoleEnum = pgEnum("member_role", ["admin", "member"]);
@@ -103,8 +102,7 @@ export const schedules = pgTable("schedules", {
 });
 
 /**
- * Server-side counterpart of the desktop app's rolling backups folder:
- * `daily` is the document as it stood before the first save of each day
+ * Automatic snapshots of the schedule: `daily` is the document as it stood before the first save of each day
  * (Central time), `replaced` is a version someone chose to write over after
  * a conflict. Pruned to the newest few of each kind per org.
  */

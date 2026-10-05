@@ -10,7 +10,7 @@ In-Line Inspection. It started as one self-contained HTML file and is being move
 in phases, onto the same stack as the sibling Project-Manager app: Next.js 15 (App
 Router) + TypeScript, PostgreSQL (Neon) via Drizzle ORM, Auth.js v5 (Credentials, JWT
 sessions), Tailwind, deployed on Vercel. Organizations are multi-tenant, as in
-Project-Manager.
+Project-Manager. It is cloud-only: there is no desktop or offline build.
 
 ## Commands
 
@@ -32,43 +32,42 @@ Postgres in both `next dev` and `next build && next start` → delete the script
 For anything touching storage, test with **two signed-in users in the same org**:
 saving, picking up the other user's save, and both sides of a conflict.
 
-## Phase 1 architecture: the scheduler runs unchanged inside the web app
+## Phase 1 architecture: the scheduler page inside the web app
 
-- `desktop/app/index.html` is **the** scheduler: one file, about 8,000 lines, with no
-  build step. It is shared by three runtimes and must keep working in all of them:
-  - **Web app:** `app/scheduler/route.ts` serves it with
-    `<script src="/scheduler/server-store.js">` injected before `</head>`. `/dashboard`
-    frames it under the app header.
-  - **Desktop (Electron):** `desktop/`. Its preload sets `window.ciliStore` to a bridge
-    to a JSON file.
-  - **Plain browser:** opened as a file with no bridge, it uses `localStorage`.
-- **Storage seam.** `detectStore()` in the HTML picks the mode: when a
-  `window.ciliStore` bridge exists, `storeMode` is `'desktop'`. The web app's bridge
-  (`public/scheduler/server-store.js`) implements the same `load()` / `save(payload, how)`
-  contract as the desktop preload, plus `kind: 'server'` and `peek()`. `serverMode` in
-  the HTML is set from `kind`, and only changes wording (`storeText()` / `recordName()`)
-  and turns on `watchServer()`.
-  When adding a storage feature, extend the bridge contract rather than branching the
-  HTML on something else, and keep desktop and plain-browser behaviour identical.
+- `scheduler/index.html` is the scheduler: one self-contained file, about 8,000 lines
+  of HTML, CSS and plain JS, with no build step. `app/scheduler/route.ts` serves it to
+  signed-in org members (with `frame-ancestors 'self'`), and `/dashboard` frames it
+  under the app header. It only works when served by the app, because it loads and saves
+  through `/api/schedule`. Opened as a file it shows a "could not be loaded" banner and
+  saves nothing.
+- **Storage** is the `// ---------- storage ----------` section of the HTML:
+  `loadState()` (GET), `saveKey()`, which marks a change and debounces it into
+  `flushSave()` (PUT of the whole document), `reloadFromServer()`, and `watchServer()`.
+  The rest of the HTML only calls `saveKey(listName, state[listName])` after changing
+  `state`.
 - **Data model.** One jsonb document per org in `schedules` (`db/schema.ts`). Its shape
   is the scheduler's backup-file format (`format`, `version`, `savedAt`, `config`,
-  `tools`, `personnel`, `equipment`, `projects`), the same as the desktop data file, so
-  a backup, the desktop file and the DB row all hold the same JSON.
+  `tools`, `personnel`, `equipment`, `projects`), so **Backup** downloads exactly what
+  the row holds and **Backup → Replace** writes a file straight back to it. Unknown
+  top-level keys are carried through untouched (`docExtras`).
 - **Concurrency.** `schedules.version` is optimistic locking. A save sends the
-  `baseVersion` it was built on. `PUT /api/schedule` takes a row lock and refuses a
-  stale base with a 409 `{conflict: true}`, and the HTML's existing conflict banner
-  offers "Load the latest version" or "Keep what is here" (`force`). Never make saves
-  last-write-wins.
+  `baseVersion` it was built on (`serverVersion` in the HTML). `PUT /api/schedule`
+  takes a row lock and refuses a stale base with 409 `{conflict: true}`. The banner then
+  offers "Load the latest version" (`reloadFromServer`) or "Keep what is here"
+  (`force`). Never make saves last-write-wins.
 - **Snapshots.** `schedule_snapshots`: one `daily` per org per Central-time day (the
   document before that day's first save, last 30 kept), plus `replaced` whenever a
-  forced save writes over a version the saver hadn't seen (last 20 kept). These mirror
-  the desktop app's `daily-*` / `replaced-*` backups.
+  forced save writes over a version the saver hadn't seen (last 20 kept).
 - **Picking up others' saves.** `watchServer()` polls `GET /api/schedule?peek=1` every
   15s and on focus. It reloads quietly only when `quietReloadSafe()` holds: nothing
-  unsaved, no save in flight, no conflict, and no editor or confirm dialog open. A
-  quiet reload keeps the window's own `config` (zoom and view), as browser tabs do.
-- `next.config.js` `outputFileTracingIncludes` puts the HTML into the `/scheduler`
-  route's serverless bundle. Without it, Vercel deployments 500 on that route.
+  unsaved, no save in flight, no conflict, no drag in progress, and no editor or confirm
+  dialog open. A quiet reload keeps the window's own `config` (zoom and view).
+- **Never write over a schedule that failed to load.** If the GET fails or the
+  document can't all be read, `saveBlocked` is set, and only **Backup → Replace** clears
+  it. An org with no row yet (first visit) gets an empty schedule created.
+- `next.config.js` `outputFileTracingIncludes` puts `scheduler/index.html` into the
+  `/scheduler` route's serverless bundle. Without it, Vercel deployments 500 on that
+  route.
 
 Later phases replace parts of the HTML with React pages and move lists out of the
 jsonb document into relational tables, one at a time. Until a list has moved, the

@@ -6,7 +6,3 @@ node_modules/
 .DS_Store
 next-env.d.ts
 tsconfig.tsbuildinfo
-
-# Electron desktop build (see desktop/README.md)
-desktop/node_modules/
-desktop/dist/
