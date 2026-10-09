@@ -14,10 +14,28 @@ export default function LoginPage() {
   );
 }
 
+// Only a page of this site: a link to /login?callbackUrl=https://elsewhere must not send
+// someone off to another site once they have signed in. The value is read the way the
+// browser will read it (it drops tabs and newlines, and takes \ for /), and anything that
+// would leave this site, or whose path starts // (another site, to a browser), opens the
+// dashboard instead.
+function safeCallback(raw: string | null) {
+  const home = "/dashboard";
+  if (!raw) return home;
+  try {
+    const base = "https://cili-scheduler.invalid";
+    const url = new URL(raw, base);
+    const path = url.pathname + url.search + url.hash;
+    return url.origin === base && path.startsWith("/") && !path.startsWith("//") ? path : home;
+  } catch {
+    return home;
+  }
+}
+
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const callbackUrl = searchParams.get("callbackUrl") || "/dashboard";
+  const callbackUrl = safeCallback(searchParams.get("callbackUrl"));
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -56,6 +74,10 @@ function LoginForm() {
     // alone isn't enough.
     const signedIn = result?.ok && result.url && !new URL(result.url).pathname.startsWith("/login");
 
+    if (result?.code === "too_many_attempts") {
+      setError("Too many sign-in attempts. Wait 15 minutes, then try again.");
+      return;
+    }
     if (!signedIn) {
       setError("Couldn't sign in. Check your email/password, or try again in a moment.");
       return;
@@ -101,9 +123,9 @@ function LoginForm() {
             </button>
           </form>
           <p className="text-sm text-cy-gray-500">
-            No account?{" "}
+            No account? Ask an admin of your organization to invite you.{" "}
             <Link href="/register" className="text-cy-blue-600 hover:underline">
-              Create one
+              Setting up a new organization?
             </Link>
           </p>
         </div>

@@ -40,11 +40,11 @@ export function ChangePasswordForm({ action }: { action: (formData: FormData) =>
       <Field label="Current password">
         <input type="password" name="currentPassword" required className={inputClass} />
       </Field>
-      <Field label="New password" hint="At least 8 characters.">
-        <input type="password" name="newPassword" required minLength={8} className={inputClass} />
+      <Field label="New password" hint="At least 12 characters.">
+        <input type="password" name="newPassword" required minLength={12} className={inputClass} />
       </Field>
       <Field label="Confirm new password">
-        <input type="password" name="confirmPassword" required minLength={8} className={inputClass} />
+        <input type="password" name="confirmPassword" required minLength={12} className={inputClass} />
       </Field>
 
       {error && <p className="text-sm text-cy-red-500">{error}</p>}

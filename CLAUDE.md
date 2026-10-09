@@ -109,3 +109,45 @@ Auth, orgs, members and invites were copied from Project-Manager and follow its 
 - All `postgres()` clients pass `prepare: false`, which Neon's pooled endpoint requires.
 - `app/dashboard/(settings)/` is a route group for ordinary padded pages (members,
   account). `app/dashboard/page.tsx` is the full-bleed scheduler frame.
+
+## Security
+
+- **Sign-up is by invitation** (`lib/registration.ts`). `/register` and `POST /api/register`
+  work only while no organization exists (a brand-new deployment), or with
+  `ALLOW_REGISTRATION=true` set. Everyone else joins through an admin's invite. The
+  check is made again inside the sign-up transaction, under an advisory lock.
+- **Sign-in is limited** (`lib/sign-in-limit.ts`, table `sign_in_attempts`).
+  - Within 15 minutes it allows 10 attempts for one email from one address, 50 from one
+    address, and 100 for one email from anywhere. With no address, 10 per email.
+  - Every attempt is counted before its password is checked, one atomic upsert per key,
+    so attempts sent all at once cannot get past a limit. The keys are counted in that
+    order and counting stops at the first limit reached, so an attempt refused at one
+    address adds nothing to that email's count: shutting someone out everywhere takes
+    a hundred attempts from ten addresses or more. An address already at its limit is
+    refused before anything is written, so new emails from it cannot fill the table.
+  - A correct password clears its email's count at its address and gives back the
+    attempt it was charged under the other two.
+  - Past a limit, `authorize()` throws a `CredentialsSignin` with code
+    `too_many_attempts`, and the sign-in page says to wait.
+  - It fails closed: if the attempt cannot be counted, no password is checked. The one
+    exception is a database the migration has not reached (the table is missing), where
+    sign-in goes on unlimited and logs an error.
+  - The current password on the change-password form is counted the same way.
+  - The client address comes from `x-forwarded-for`, which Vercel overwrites, so it can
+    be faked anywhere else. IPv6 addresses count by their /64 network.
+  - To let someone back in before the window ends, delete their rows from
+    `sign_in_attempts` (keys start `pair:<email>|`, `email:<email>`, `addr:<address>`).
+  - An unknown email is checked against a placeholder hash, so the answer takes as long
+    as for a wrong password.
+- **The sign-in page opens only paths on this site** after signing in (`safeCallback` in
+  `app/login/page.tsx`). It parses `callbackUrl` as the browser will, which drops tabs and
+  newlines and reads `\` as `/`, and refuses any other origin or a path starting `//`.
+- **New passwords** need at least 12 characters: sign-up, invite and password change.
+- **Headers** (`next.config.js`). Every response carries X-Frame-Options,
+  `frame-ancestors 'self'`, nosniff, Referrer-Policy, Permissions-Policy and HSTS.
+  `/scheduler` sends a strict CSP of its own (`app/scheduler/route.ts`):
+  - Only the page's inline script may run, named by its SHA-256 hash, which is worked out
+    from the file as served (line endings made `\n` first, as browsers do).
+  - `connect-src` is `'self'`, and objects are blocked.
+  - Keep the page free of inline event handlers (`onclick=` and the like), `eval` and
+    outside scripts, or the policy will block them.

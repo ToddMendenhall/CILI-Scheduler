@@ -102,6 +102,24 @@ export const schedules = pgTable("schedules", {
 });
 
 /**
+ * Sign-in attempts, counted per email from one address, per email and per address
+ * over a short window, so that sign-in refuses for a while once too many have been
+ * tried (lib/sign-in-limit.ts). One row is one key's current window.
+ */
+export const signInAttempts = pgTable(
+  "sign_in_attempts",
+  {
+    key: varchar("key", { length: 400 }).primaryKey(),
+    attempts: integer("attempts").notNull().default(0),
+    windowStart: timestamp("window_start", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    // rows from long-finished windows are deleted by window_start
+    windowIdx: index("sign_in_attempts_window_idx").on(table.windowStart),
+  }),
+);
+
+/**
  * Automatic snapshots of the schedule: `daily` is the document as it stood before the first save of each day
  * (Central time), `replaced` is a version someone chose to write over after
  * a conflict. Pruned to the newest few of each kind per org.
