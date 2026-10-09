@@ -8,14 +8,14 @@ import { invites, orgMembers, users } from "@/db/schema";
 const acceptSchema = z.object({
   token: z.string().min(1),
   name: z.string().trim().min(1).max(255),
-  password: z.string().min(8),
+  password: z.string().min(12, "Choose a password of at least 12 characters."),
 });
 
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
   const parsed = acceptSchema.safeParse(body);
   if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid input." }, { status: 400 });
+    return NextResponse.json({ error: parsed.error.issues[0]?.message ?? "Invalid input." }, { status: 400 });
   }
   const { token, name, password } = parsed.data;
 

@@ -61,7 +61,7 @@ export function AcceptInviteForm({ token, email }: { token: string; email: strin
         <input
           type="password"
           required
-          minLength={8}
+          minLength={12}
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           className={inputClass}
