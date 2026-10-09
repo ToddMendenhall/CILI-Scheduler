@@ -7,8 +7,8 @@ import { users } from "@/db/schema";
 import { authConfig } from "@/lib/auth.config";
 import { clientAddress, MAX_EMAIL_LENGTH, signInSucceeded, takeSignInAttempt } from "@/lib/sign-in-limit";
 
-// Too many wrong passwords for this email (or from this address) in the current
-// window: the sign-in page says so instead of "check your email/password".
+// Too many attempts for this email (or from this address) in the current window:
+// the sign-in page says so instead of "check your email/password".
 class TooManySignInAttempts extends CredentialsSignin {
   code = "too_many_attempts";
 }
@@ -33,17 +33,14 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         if (!rawEmail || !password) return null;
         const email = rawEmail.trim().toLowerCase();
         if (email.length > MAX_EMAIL_LENGTH) return null;
-        const address = clientAddress(request);
+        const address = clientAddress(request?.headers);
 
         // Counted before any password is checked, so a locked-out guesser learns nothing more,
         // and attempts sent all at once cannot get past the limit (lib/sign-in-limit.ts).
-        let allowed = true;
-        try {
-          allowed = await takeSignInAttempt(email, address);
-        } catch (err) {
-          console.error("[auth] sign-in limit check failed:", err);
-        }
-        if (!allowed) throw new TooManySignInAttempts();
+        // When the count cannot be kept, no password is checked either.
+        const verdict = await takeSignInAttempt(email, address);
+        if (verdict === "refused") throw new TooManySignInAttempts();
+        if (verdict !== "allowed") return null;
 
         try {
           const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
@@ -59,11 +56,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             return null;
           }
 
-          try {
-            await signInSucceeded(email, address);
-          } catch (err) {
-            console.error("[auth] could not clear the sign-in count:", err);
-          }
+          await signInSucceeded(email, address);
           return { id: user.id, email: user.email, name: user.name };
         } catch (err) {
           // Surface the real cause in server logs — a DB error here would

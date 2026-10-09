@@ -14,11 +14,22 @@ export default function LoginPage() {
   );
 }
 
-// Only a path on this site: a link to /login?callbackUrl=https://elsewhere must not send
-// someone off to another site once they have signed in.
+// Only a page of this site: a link to /login?callbackUrl=https://elsewhere must not send
+// someone off to another site once they have signed in. The value is read the way the
+// browser will read it (it drops tabs and newlines, and takes \ for /), and anything that
+// would leave this site, or whose path starts // (another site, to a browser), opens the
+// dashboard instead.
 function safeCallback(raw: string | null) {
-  if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/\\")) return "/dashboard";
-  return raw;
+  const home = "/dashboard";
+  if (!raw) return home;
+  try {
+    const base = "https://cili-scheduler.invalid";
+    const url = new URL(raw, base);
+    const path = url.pathname + url.search + url.hash;
+    return url.origin === base && path.startsWith("/") && !path.startsWith("//") ? path : home;
+  } catch {
+    return home;
+  }
 }
 
 function LoginForm() {
@@ -64,7 +75,7 @@ function LoginForm() {
     const signedIn = result?.ok && result.url && !new URL(result.url).pathname.startsWith("/login");
 
     if (result?.code === "too_many_attempts") {
-      setError("Too many wrong passwords. Wait 15 minutes, then try again.");
+      setError("Too many sign-in attempts. Wait 15 minutes, then try again.");
       return;
     }
     if (!signedIn) {
